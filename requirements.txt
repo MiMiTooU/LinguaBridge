@@ -1,0 +1,7 @@
+paddlepaddle
+pytest-runner
+setuptools
+paddlespeech
+fastapi
+uvicorn[standard]
+python-multipart

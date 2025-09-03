@@ -1,0 +1,7 @@
+exp
+output
+.venv
+__pycache__
+*.pyc
+.idea
+static
