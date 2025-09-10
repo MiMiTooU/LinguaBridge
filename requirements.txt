@@ -1,7 +1,9 @@
-paddlepaddle
-pytest-runner
-setuptools
-paddlespeech
 fastapi
 uvicorn[standard]
 python-multipart
+websockets
+pyaudio
+langchain
+langchain-community
+qianfan
+websocket-client

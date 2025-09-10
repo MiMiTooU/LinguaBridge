@@ -1,226 +1,238 @@
+"""
+ASR方言识别服务抽象基类和服务管理
+"""
 import os
+import sys
 import logging
+import tempfile
+import subprocess
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Optional
 from pathlib import Path
-from typing import Optional, Dict, Any
-from paddlespeech.cli.asr.infer import ASRExecutor
-from audio_recoder import AudioTranscoder
+from pydantic import BaseModel, Field
+
+# 设置日志
+logger = logging.getLogger(__name__)
+
+# Pydantic模型定义
+class ASRRecognitionSegment(BaseModel):
+    """ASR识别结果段落模型"""
+    text: str = Field(..., description="识别的文本内容")
+    emotion: Optional[str] = Field(None, description="情感信息")
+    speaker: Optional[str] = Field(None, description="说话人信息")
+    language: Optional[str] = Field(None, description="语言信息")
+    start_time: Optional[float] = Field(None, description="开始时间(秒)")
+    end_time: Optional[float] = Field(None, description="结束时间(秒)")
+    confidence: Optional[float] = Field(None, description="置信度")
 
 
-class ASRDialectService:
+# 服务注册表
+ASR_SERVICE_REGISTRY = {}
+
+def register_asr_service(name: str):
     """
-    ASR方言识别服务
-    使用PaddleSpeech的ASR功能进行语音识别
+    ASR服务注册装饰器
+    
+    Args:
+        name: 服务名称
+    """
+    def decorator(cls):
+        ASR_SERVICE_REGISTRY[name] = cls
+        logger.info(f"ASR服务已注册: {name} -> {cls.__name__}")
+        return cls
+    return decorator
+
+
+class ASRDialectService(ABC):
+    """
+    ASR方言识别服务抽象基类
+    定义了所有ASR服务必须实现的接口
     """
     
-    def __init__(self, 
-                 model: str = "conformer_wenetspeech",
-                 lang: str = "zh",
-                 sample_rate: int = 16000,
-                 output_dir: str = "output"):
+    def __init__(self, sample_rate: int = 16000, output_dir: str = "output"):
         """
-        初始化ASR方言识别服务
+        初始化ASR服务
         
         Args:
-            model: ASR模型名称，默认使用conformer_wenetspeech
-            lang: 语言，默认为zh(中文)
             sample_rate: 采样率，默认16000Hz
             output_dir: 输出目录
         """
-        self.model = model
-        self.lang = lang
         self.sample_rate = sample_rate
+        self.output_dir = output_dir
+        self.logger = logging.getLogger(self.__class__.__name__)
         
-        # 初始化音频转码器
-        self.audio_transcoder = AudioTranscoder(output_dir=output_dir)
-        
-        # 初始化ASR执行器
-        self.asr_executor = None
-        
-        # 设置日志
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
     
-    def _initialize_asr(self):
+    @abstractmethod
+    def recognize_audio(self, audio_file: str) -> List[ASRRecognitionSegment]:
         """
-        懒加载初始化ASR执行器
-        """
-        if self.asr_executor is None:
-            try:
-                self.logger.info(f"初始化ASR模型: {self.model}")
-                self.asr_executor = ASRExecutor()
-                self.logger.info("ASR模型初始化成功")
-            except Exception as e:
-                self.logger.error(f"ASR模型初始化失败: {e}")
-                raise RuntimeError(f"ASR模型初始化失败: {e}")
-    
-    def recognize_audio(self, 
-                       audio_file: str, 
-                       wav_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        识别音频文件中的语音
+        识别音频文件 - 抽象方法
         
         Args:
-            audio_file: 输入音频文件路径
-            wav_params: 音频转码参数，可选
+            audio_file: 音频文件路径
+            
+        Returns:
+            List[ASRRecognitionSegment]: 识别结果段落列表
+        """
+        pass
+    
+    @abstractmethod
+    def batch_recognize(self, audio_files: List[str]) -> List[List[ASRRecognitionSegment]]:
+        """
+        批量识别音频文件 - 抽象方法
+        
+        Args:
+            audio_files: 音频文件路径列表
+            
+        Returns:
+            List[List[ASRRecognitionSegment]]: 批量识别结果
+        """
+        pass
+    
+    @abstractmethod
+    def ping(self) -> bool:
+        """
+        检查服务是否可用 - 抽象方法
         
         Returns:
-            Dict[str, Any]: 识别结果，包含文本和元数据
-            
-        Raises:
-            FileNotFoundError: 音频文件不存在
-            RuntimeError: ASR识别失败
+            bool: 服务是否可用
         """
+        pass
+    
+    @abstractmethod
+    def get_service_info(self) -> Dict[str, Any]:
+        """
+        获取服务信息 - 抽象方法
+        
+        Returns:
+            Dict[str, Any]: 服务信息
+        """
+        pass
+
+
+# 全局服务实例缓存
+ASR_SERVICE_INSTANCES = {}
+
+# 配置重试次数
+ASR_PING_RETRY_COUNT = 3
+
+
+def create_asr_service(service_name: str = "funasr", **kwargs) -> ASRDialectService:
+    """
+    根据服务名称创建ASR服务实例，优先使用缓存实例
+    
+    Args:
+        service_name: 服务名称
+        **kwargs: 服务初始化参数
+        
+    Returns:
+        ASRDialectService: ASR服务实例
+        
+    Raises:
+        ValueError: 服务未注册或不可用
+    """
+    if service_name not in ASR_SERVICE_REGISTRY:
+        raise ValueError(f"ASR服务 '{service_name}' 未注册")
+    
+    # 优先使用缓存的服务实例
+    if service_name in ASR_SERVICE_INSTANCES:
+        cached_instance = ASR_SERVICE_INSTANCES[service_name]
         try:
-            # 检查输入文件
-            if not Path(audio_file).exists():
-                raise FileNotFoundError(f"音频文件不存在: {audio_file}")
-            
-            self.logger.info(f"开始处理音频文件: {audio_file}")
-            
-            # 设置默认转码参数，保证与ASR模型兼容
-            default_wav_params = {
-                "sample_rate": self.sample_rate,
-                "channels": 1,
-                "bit_depth": 16,
-                "codec": "pcm_s16le"
-            }
-            
-            if wav_params:
-                default_wav_params.update(wav_params)
-            
-            # 步骤1: 转码音频文件
-            self.logger.info("步骤1: 转码音频文件")
-            transcoded_file = self.audio_transcoder.transcode_to_wav(
-                audio_file, 
-                default_wav_params
-            )
-            self.logger.info(f"音频转码完成: {transcoded_file}")
-            
-            # 步骤2: 初始化ASR模型（懒加载）
-            self._initialize_asr()
-            
-            # 步骤3: 执行ASR识别
-            self.logger.info("步骤3: 执行ASR识别")
-            recognition_result = self.asr_executor(
-                audio_file=transcoded_file,
-                model=self.model,
-                lang=self.lang,
-                sample_rate=self.sample_rate
-            )
-            
-            # 整理返回结果
-            result = {
-                "success": True,
-                "text": recognition_result,
-                "original_file": audio_file,
-                "transcoded_file": transcoded_file,
-                "model": self.model,
-                "language": self.lang,
-                "sample_rate": self.sample_rate,
-                "wav_params": default_wav_params
-            }
-            
-            self.logger.info(f"ASR识别成功: {recognition_result}")
-            return result
-            
-        except FileNotFoundError:
-            raise
+            if cached_instance.ping():
+                logger.debug(f"使用缓存的ASR服务实例: {service_name}")
+                return cached_instance
+            else:
+                logger.warning(f"缓存的ASR服务实例 {service_name} ping失败，将重新创建")
+                del ASR_SERVICE_INSTANCES[service_name]
         except Exception as e:
-            error_msg = f"ASR识别失败: {e}"
-            self.logger.error(error_msg)
-            return {
-                "success": False,
-                "error": str(e),
-                "original_file": audio_file,
-                "model": self.model,
-                "language": self.lang
-            }
+            logger.warning(f"缓存的ASR服务实例 {service_name} ping异常: {e}，将重新创建")
+            del ASR_SERVICE_INSTANCES[service_name]
     
-    def batch_recognize(self, 
-                       input_dir: str, 
-                       wav_params: Optional[Dict[str, Any]] = None,
-                       supported_formats: Optional[list] = None) -> list:
-        """
-        批量识别目录中的音频文件
+    # 创建新的服务实例
+    service_class = ASR_SERVICE_REGISTRY[service_name]
+    service_instance = service_class(**kwargs)
+    
+    # 缓存服务实例
+    ASR_SERVICE_INSTANCES[service_name] = service_instance
+    
+    logger.info(f"创建新的ASR服务实例: {service_name}")
+    return service_instance
+
+
+def get_available_asr_services() -> List[str]:
+    """
+    获取所有可用的ASR服务列表，带重试机制
+    
+    Returns:
+        List[str]: 可用的ASR服务名称列表
+    """
+    available_services = []
+    
+    for name, service_class in ASR_SERVICE_REGISTRY.items():
+        service_available = False
         
-        Args:
-            input_dir: 输入目录路径
-            wav_params: 音频转码参数
-            supported_formats: 支持的音频格式列表
-        
-        Returns:
-            list: 批量识别结果列表
-        """
-        if supported_formats is None:
-            supported_formats = [
-                ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma", 
-                ".amr", ".3gp", ".opus", ".webm", ".mp4", ".wav"
-            ]
-        
-        input_path = Path(input_dir)
-        if not input_path.exists():
-            raise FileNotFoundError(f"输入目录不存在: {input_dir}")
-        
-        results = []
-        
-        for file_path in input_path.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in supported_formats:
+        # 检查是否有缓存的实例
+        if name in ASR_SERVICE_INSTANCES:
+            service_instance = ASR_SERVICE_INSTANCES[name]
+            
+            # 尝试ping缓存的实例，带重试机制
+            for retry in range(ASR_PING_RETRY_COUNT):
                 try:
-                    result = self.recognize_audio(str(file_path), wav_params)
-                    results.append(result)
+                    if service_instance.ping():
+                        service_available = True
+                        logger.debug(f"ASR服务 '{name}' 缓存实例ping成功 (重试 {retry + 1}/{ASR_PING_RETRY_COUNT})")
+                        break
+                    else:
+                        logger.warning(f"ASR服务 '{name}' 缓存实例ping失败 (重试 {retry + 1}/{ASR_PING_RETRY_COUNT})")
                 except Exception as e:
-                    self.logger.error(f"批量识别失败 {file_path}: {e}")
-                    results.append({
-                        "success": False,
-                        "error": str(e),
-                        "original_file": str(file_path)
-                    })
-        
-        self.logger.info(f"批量识别完成，处理 {len(results)} 个文件")
-        return results
-    
-    def get_supported_models(self) -> list:
-        """
-        获取支持的ASR模型列表
-        
-        Returns:
-            list: 支持的模型列表
-        """
-        # PaddleSpeech支持的主要ASR模型
-        return [
-            "conformer_wenetspeech",  # 中文通用模型
-            "conformer_aishell",      # 中文模型
-            "deepspeech2_aishell",    # 中文模型
-            "conformer_librispeech",  # 英文模型
-            "deepspeech2_librispeech" # 英文模型
-        ]
-
-
-# 使用示例
-if __name__ == "__main__":
-    # 创建服务实例
-    asr_service = ASRDialectService()
-    
-    # 示例1: 识别单个音频文件
-    try:
-        result = asr_service.recognize_audio("zh.wav")
-        if result["success"]:
-            print(f"识别成功: {result['text']}")
+                    logger.warning(f"ASR服务 '{name}' 缓存实例ping异常: {e} (重试 {retry + 1}/{ASR_PING_RETRY_COUNT})")
+                
+                # 如果不是最后一次重试，重新创建实例
+                if retry < ASR_PING_RETRY_COUNT - 1:
+                    try:
+                        logger.info(f"重新创建ASR服务实例: {name}")
+                        service_instance = service_class()
+                        ASR_SERVICE_INSTANCES[name] = service_instance
+                    except Exception as e:
+                        logger.error(f"重新创建ASR服务实例 '{name}' 失败: {e}")
+                        break
         else:
-            print(f"识别失败: {result['error']}")
-    except Exception as e:
-        print(f"处理失败: {e}")
+            # 没有缓存实例，尝试创建新实例并ping
+            for retry in range(ASR_PING_RETRY_COUNT):
+                try:
+                    service_instance = service_class()
+                    if service_instance.ping():
+                        ASR_SERVICE_INSTANCES[name] = service_instance
+                        service_available = True
+                        logger.debug(f"ASR服务 '{name}' 新实例创建并ping成功 (重试 {retry + 1}/{ASR_PING_RETRY_COUNT})")
+                        break
+                    else:
+                        logger.warning(f"ASR服务 '{name}' 新实例ping失败 (重试 {retry + 1}/{ASR_PING_RETRY_COUNT})")
+                except Exception as e:
+                    logger.warning(f"ASR服务 '{name}' 创建或ping异常: {e} (重试 {retry + 1}/{ASR_PING_RETRY_COUNT})")
+        
+        if service_available:
+            available_services.append(name)
+        else:
+            # 清理失败的缓存实例
+            if name in ASR_SERVICE_INSTANCES:
+                del ASR_SERVICE_INSTANCES[name]
+                logger.info(f"清理失败的ASR服务缓存实例: {name}")
     
-    # 示例2: 查看支持的模型
-    print(f"支持的模型: {asr_service.get_supported_models()}")
+    return available_services
+
+
+def get_registered_asr_services() -> Dict[str, type]:
+    """
+    获取所有已注册的ASR服务
     
-    # 示例3: 批量识别
-    # try:
-    #     results = asr_service.batch_recognize("input_folder")
-    #     for result in results:
-    #         if result["success"]:
-    #             print(f"文件: {result['original_file']}, 识别结果: {result['text']}")
-    #         else:
-    #             print(f"文件: {result['original_file']}, 识别失败: {result['error']}")
-    # except Exception as e:
-    #     print(f"批量识别失败: {e}")
+    Returns:
+        Dict[str, type]: 已注册的ASR服务字典
+    """
+    return ASR_SERVICE_REGISTRY.copy()
+
+
+# 导入服务实现以确保装饰器注册生效
+from services.asr import *
+from services.summary import *

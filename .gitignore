@@ -1,7 +1,12 @@
 exp
 output
+services/output
+services/exp
+services/__pycache__
 .venv
 __pycache__
 *.pyc
 .idea
 static
+.env
+logs

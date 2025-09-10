@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  linguabridge:
+    build: .
+    container_name: linguabridge-app
+    ports:
+      - "8000:8000"
+    volumes:
+      # 挂载输出目录以持久化转码文件
+      - ./output:/app/output
+      # 挂载日志目录
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
